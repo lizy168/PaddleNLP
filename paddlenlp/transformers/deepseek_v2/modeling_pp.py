@@ -170,8 +170,9 @@ class DeepseekV2EmbeddingPipe(nn.Layer):
             batch_size, seq_length, _ = inputs_embeds.shape
 
             if self.sequence_parallel:
+                inputs_embeds = paddle.transpose(inputs_embeds, [1, 0, 2]) # [B, S, H] --> [S, B, H]
                 # [bs, seq_len, num_head * head_dim] -> [bs * seq_len, num_head * head_dim]
-                inputs_embeds = paddle.reshape(inputs_embeds, [-1, inputs_embeds.shape[-1]])
+                # inputs_embeds = paddle.reshape(inputs_embeds, [-1, inputs_embeds.shape[-1]])
                 # [seq_len * bs / n, num_head * head_dim] (n is mp parallelism)
                 inputs_embeds = ScatterOp.apply(inputs_embeds)
             embeds_res = [inputs_embeds]
@@ -184,7 +185,8 @@ class DeepseekV2EmbeddingPipe(nn.Layer):
                     axis=1,
                 )
                 if self.sequence_parallel:
-                    inputs_embeds_mtp = inputs_embeds_mtp.reshape([-1, inputs_embeds_mtp.shape[-1]])
+                    inputs_embeds_mtp = paddle.transpose(inputs_embeds_mtp, [1, 0, 2]) # [B, S, H] --> [S, B, H]
+                    # inputs_embeds_mtp = inputs_embeds_mtp.reshape([-1, inputs_embeds_mtp.shape[-1]])
                     inputs_embeds_mtp = ScatterOp.apply(inputs_embeds_mtp)
                 embeds_res.append(inputs_embeds_mtp)
             # if not self.sequence_parallel
@@ -195,7 +197,8 @@ class DeepseekV2EmbeddingPipe(nn.Layer):
             return return_args(inputs_embeds, attention_mask, attn_mask_startend_row_indices, position_ids)
         else:
             if self.sequence_parallel:
-                inputs_embeds = inputs_embeds.reshape([-1, inputs_embeds.shape[-1]])
+                inputs_embeds = paddle.transpose(inputs_embeds, [1, 0, 2]) # [B, S, H] --> [S, B, H]
+                # inputs_embeds = inputs_embeds.reshape([-1, inputs_embeds.shape[-1]])
                 inputs_embeds = ScatterOp.apply(inputs_embeds)
             return return_args(inputs_embeds, attention_mask, attn_mask_startend_row_indices, position_ids)
 
@@ -205,7 +208,7 @@ class DeepseekV2DecoderLayerPipe(DeepseekV2DecoderLayer):
         hidden_states, attention_mask, attn_mask_startend_row_indices, position_ids = parse_args(args)
 
         if self.config.num_nextn_predict_layers > 0:
-            batch_size, _, hidden_size = hidden_states.shape
+            hidden_size = hidden_states.shape[-1]
             batch_size_mtp = hidden_size // (self.config.num_nextn_predict_layers + 1)
             inputs_embeds_mtp = hidden_states[..., -batch_size_mtp:]
             hidden_states = hidden_states[..., :batch_size_mtp]

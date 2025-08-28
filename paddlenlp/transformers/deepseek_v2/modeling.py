@@ -34,6 +34,7 @@ import paddle.nn.functional as F
 from paddle import Tensor, nn
 from paddle.distributed import fleet
 from paddle.distributed.fleet.meta_parallel import get_rng_state_tracker
+from paddle.distributed.communication.reduce import ReduceOp
 from paddle.distributed.fleet.recompute.recompute import recompute
 from paddle.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
@@ -892,6 +893,10 @@ class DeepseekV2Attention(nn.Layer):
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
+        self.num_local_heads = self.num_heads
+        if config.tensor_parallel_degree > 1:
+            assert self.num_heads % config.tensor_parallel_degree == 0, f"Attention head num ({self.num_heads}) is not divisible by tensor_parallel_degree ({config.tensor_parallel_degree})."
+            self.num_local_heads = self.num_heads // config.tensor_parallel_degree
 
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
@@ -940,18 +945,18 @@ class DeepseekV2Attention(nn.Layer):
 
             if self.q_lora_rank is None:
                 with linear_dtype_gaurd():
-                    self.q_proj = ColumnParallelLinear(self.hidden_size, self.num_heads * self.q_head_dim, has_bias=False, gather_output=True)
+                    self.q_proj = ColumnParallelLinear(self.hidden_size, self.num_heads * self.q_head_dim, has_bias=False, gather_output=False)
             else:
                 with linear_dtype_gaurd():
                     self.q_a_proj = Linear(self.hidden_size, config.q_lora_rank, bias_attr=config.attention_bias)
-                    self.q_b_proj = ColumnParallelLinear(config.q_lora_rank, self.num_heads * self.q_head_dim, has_bias=False, gather_output=True)
-                self.q_a_layernorm = DeepseekV2RMSNorm(config=config, hidden_size=config.q_lora_rank, use_sequence_parallel=False)
+                    self.q_b_proj = ColumnParallelLinear(config.q_lora_rank, self.num_heads * self.q_head_dim, has_bias=False, gather_output=False)
+                self.q_a_layernorm = DeepseekV2RMSNorm(config=config, hidden_size=config.q_lora_rank)
 
             with linear_dtype_gaurd():
                 self.kv_a_proj_with_mqa = Linear(self.hidden_size, config.kv_lora_rank + config.qk_rope_head_dim, bias_attr=config.attention_bias)
-                self.kv_b_proj = ColumnParallelLinear(config.kv_lora_rank, self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim), has_bias=False, gather_output=True)
-                self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim, self.hidden_size, has_bias=config.attention_bias, input_is_parallel=False)
-            self.kv_a_layernorm = DeepseekV2RMSNorm(config=config, hidden_size=config.kv_lora_rank, use_sequence_parallel=False)
+                self.kv_b_proj = ColumnParallelLinear(config.kv_lora_rank, self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim), has_bias=False, gather_output=False)
+                self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim, self.hidden_size, has_bias=config.attention_bias, input_is_parallel=True)
+            self.kv_a_layernorm = DeepseekV2RMSNorm(config=config, hidden_size=config.kv_lora_rank)
         else:
             # for without tensor parallel
             if self.q_lora_rank is None:
@@ -1047,7 +1052,11 @@ class DeepseekV2Attention(nn.Layer):
             warnings.warn(
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
             )
-        bsz, q_len, _ = hidden_states.shape
+        ori_shape = hidden_states.shape
+        if self.config.sequence_parallel:
+            seq_len, bsz, _ = hidden_states.shape
+        else:
+            bsz, seq_len, _ = hidden_states.shape
 
         # DeepSeekV2 q_lora_rank=1536
         # DeepSeekV2-lite q_lora_rank=None
@@ -1057,8 +1066,8 @@ class DeepseekV2Attention(nn.Layer):
             q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
 
         if self.sequence_parallel:
-            target_query_shape = [-1, self.seq_length, self.num_heads, self.q_head_dim]
-            target_key_value_shape = [-1, self.seq_length, self.num_heads, self.qk_nope_head_dim + self.v_head_dim]
+            target_query_shape = [bsz, self.seq_length, self.num_local_heads, self.q_head_dim]
+            target_key_value_shape = [bsz, self.seq_length, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim]
         else:
             target_query_shape = [0, 0, self.num_heads, self.q_head_dim]
             target_key_value_shape = [0, 0, self.num_heads, self.qk_nope_head_dim + self.v_head_dim]
@@ -1071,8 +1080,9 @@ class DeepseekV2Attention(nn.Layer):
         compressed_kv, k_pe = paddle.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], axis=-1)
         if self.sequence_parallel:
             k_pe = GatherOp.apply(k_pe)
-        k_pe = k_pe.reshape([-1, q_len, 1, self.qk_rope_head_dim]).expand(
-            [-1, q_len, self.num_heads, self.qk_rope_head_dim]
+            k_pe = paddle.transpose(k_pe, [1, 0, 2])
+        k_pe = k_pe.reshape([-1, self.seq_length, 1, self.qk_rope_head_dim]).expand(
+            [-1, self.seq_length, self.num_local_heads, self.qk_rope_head_dim]
         )
 
         # self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim = 128+64
@@ -1140,6 +1150,9 @@ class DeepseekV2Attention(nn.Layer):
         # if sequence_parallel is true, out shape are [q_len / n, bs, num_head * head_dim]
         # else their shape are [bs, q_len, num_head * head_dim], n is mp parallelism.
         attn_output = self.o_proj(attn_output)
+        if attn_output.shape != ori_shape:
+            attn_output = attn_output.reshape(ori_shape)
+
 
         if not output_attentions:
             attn_weights = None
@@ -1975,7 +1988,8 @@ class DeepseekV2Model(DeepseekV2PretrainedModel):
         if self.config.sequence_parallel:
             # [bs, seq_len, num_head * head_dim] -> [bs * seq_len, num_head * head_dim]
             bs, seq_len, hidden_size = inputs_embeds.shape
-            inputs_embeds = paddle.reshape(inputs_embeds, [bs * seq_len, hidden_size])
+            inputs_embeds = paddle.transpose(inputs_embeds, [1, 0, 2]) # [B, S, H] --> [S, B, H]
+            # inputs_embeds = paddle.reshape(inputs_embeds, [bs * seq_len, hidden_size])
             # [seq_len * bs / n, num_head * head_dim] (n is mp parallelism)
             inputs_embeds = ScatterOp.apply(inputs_embeds)
 
@@ -2057,7 +2071,8 @@ class DeepseekV2Model(DeepseekV2PretrainedModel):
 
                 if self.config.sequence_parallel:
                     hidden_states = GatherOp.apply(hidden_states)
-                    hidden_states = hidden_states.reshape([-1, seq_length, hidden_states.shape[-1]])
+                    hidden_states = paddle.transpose(hidden_states, [1, 0, 2]) # [S, B, H] --> [B, S, H]
+                    # hidden_states = hidden_states.reshape([-1, seq_length, hidden_states.shape[-1]])
 
                 inputs_embeds_cur_depth = paddle.concat(
                     [inputs_embeds_ori[:, (nextn + 1) :, :], inputs_embeds_extra[:, : (nextn + 1), :]], axis=1
@@ -2122,7 +2137,12 @@ class DeepseekV2PretrainingCriterion(nn.Layer):
         else:
             self.loss_func = paddle.nn.CrossEntropyLoss(reduction="none", ignore_index=self.ignore_index)
 
+        if self.config.sequence_parallel:
+            self.seq_para_scale = 1.0 / self.config.tensor_parallel_degree
+            self.mp_group = fleet.get_hybrid_communicate_group().get_model_parallel_group()
+
     def forward(self, prediction_scores, masked_lm_labels, router_loss=None, mtp_logits=None):
+
         if self.enable_parallel_cross_entropy:
             if prediction_scores.shape[-1] == self.config.vocab_size:
                 warnings.warn(
@@ -2151,13 +2171,33 @@ class DeepseekV2PretrainingCriterion(nn.Layer):
             masked_lm_labels_ori = masked_lm_labels
             masked_lm_labels = masked_lm_labels[:, : -self.config.num_nextn_predict_layers]
             seq_length = masked_lm_labels.shape[1]
+
+            if self.config.sequence_parallel:
+                masked_lm_labels = masked_lm_labels.transpose([1, 0]) # [B, S] --> [S, B]
+                masked_lm_labels = ScatterOp.apply(masked_lm_labels)
+
             loss = compute_loss(prediction_scores, masked_lm_labels)
+
+            if self.config.sequence_parallel:
+                loss = loss * self.seq_para_scale
+                dist.all_reduce(loss, op=ReduceOp.SUM, group=self.mp_group)
 
             mtp_loss_res = []
             for depth in range(self.config.num_nextn_predict_layers):
                 prediction_scores_cur_depth = mtp_logits[depth]
                 masked_lm_labels_cur_depth = masked_lm_labels_ori[:, (depth + 1) : (depth + 1 + seq_length)]
+
+                if self.config.sequence_parallel:
+                    masked_lm_labels_cur_depth = masked_lm_labels_cur_depth.transpose([1, 0]) # [B, S] --> [S, B]
+                    masked_lm_labels_cur_depth = ScatterOp.apply(masked_lm_labels_cur_depth)
+
                 res_cur_depth = compute_loss(prediction_scores_cur_depth, masked_lm_labels_cur_depth)
+                
+                if self.config.sequence_parallel:
+                    res_cur_depth = res_cur_depth * self.seq_para_scale
+                    dist.all_reduce(res_cur_depth, op=ReduceOp.SUM, group=self.mp_group)
+
+
                 mtp_loss_res.append(res_cur_depth)
             loss = add_loss(loss, self.config.num_nextn_predict_lambda * sum([x for x in mtp_loss_res]) / len(mtp_loss_res))  # fmt: skip
 
@@ -2203,9 +2243,11 @@ class DeepseekV2LMHead(nn.Layer):
                 self.xpu_parallel_matmul = None
 
     def forward(self, hidden_states, tensor_parallel_output=None):
-        if self.config.sequence_parallel:
-            hidden_states = GatherOp.apply(hidden_states)
-            hidden_states = paddle.reshape_(hidden_states, [-1, self.seq_length, self.config.hidden_size])
+
+        # if self.config.sequence_parallel:
+            # hidden_states = GatherOp.apply(hidden_states)
+            # hidden_states = paddle.transpose(hidden_states, [1, 0, 2])
+            # hidden_states = paddle.reshape_(hidden_states, [-1, self.seq_length, self.config.hidden_size])
 
         if tensor_parallel_output is None:
             tensor_parallel_output = self.config.tensor_parallel_output
