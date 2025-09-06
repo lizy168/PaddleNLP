@@ -411,28 +411,22 @@ class ShardingIO:
         return state_dict
 
     def _load_optimizer_state_of_one_shard(self, checkpoint, base_opt_name, optimizer_name_suffix, group_getter=None):
-        def load_impl(_base_opt_name):
-            optimizer_name = _add_variant(_base_opt_name, optimizer_name_suffix)
-            path = os.path.join(checkpoint, optimizer_name)
-            logger.info(f"load optimizer state from {path}")
-            if os.path.isfile(path):
-                return self._remap_parameter_name(
-                    checkpoint,
-                    self._modify_ckpt_for_compatibility(paddlenlp_load(path, map_location="cpu")),
-                    is_opt=True,
-                )
-            logger.info(f"{path} not exists")
-            return None
-
-        opt_state = load_impl(base_opt_name)
         if self.is_ema:
-            ema_opt_state = load_impl(base_opt_name.replace("optimizer", "ema"))
-            if ema_opt_state is not None:
-                assert opt_state is not None, "optimizer state should exist when EMA optimizer state exists"
-                opt_state["master_weights"] = ema_opt_state.pop("master_weights", {})
-            else:
-                assert opt_state is None, "optimizer state should not exist when EMA optimizer state does not exist"
-        return opt_state
+            base_opt_name = base_opt_name.replace("optimizer", "ema")
+        optimizer_name = _add_variant(base_opt_name, optimizer_name_suffix)
+        path = os.path.join(checkpoint, optimizer_name)
+        logger.info(f"load optimizer state from {path}")
+        if os.path.isfile(path):
+            opt_state = paddlenlp_load(path, map_location="cpu")
+            if self.is_ema:
+                opt_state = {"master_weights": opt_state.get("master_weights", {})}
+            return self._remap_parameter_name(
+                checkpoint,
+                self._modify_ckpt_for_compatibility(opt_state),
+                is_opt=True,
+            )
+        logger.info(f"{path} not exists")
+        return None
 
     def _modify_ckpt_for_compatibility(self, ckpt):
         master_weights = ckpt.get("master_weights", None)
@@ -611,11 +605,7 @@ class ShardingIO:
 
         node_model_state = load_model_slices()
         node_model_state = reshard_pp(node_model_state)
-        opt_state = reshard_sharding(node_model_state)
-        if self.is_ema:
-            return {"master_weights": opt_state.get("master_weights", {})}
-        else:
-            return opt_state
+        return reshard_sharding(node_model_state)
 
     def manipulate_state_dict_and_config(self, model_to_save, merge_tensor_parallel=False, state_dict=None):
         weight_name_suffix = self.args.sharded_name_suffix()
