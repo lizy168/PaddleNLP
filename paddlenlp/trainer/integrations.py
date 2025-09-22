@@ -493,12 +493,14 @@ class SwanLabCallback(TrainerCallback):
             elif trial_name is not None:
                 init_args["experiment_name"] = trial_name
             init_args["project"] = os.getenv("SWANLAB_PROJECT", "PaddleNLP")
+            if args.logging_dir is not None:
+                init_args["logdir"] = os.getenv("SWANLAB_LOG_DIR", args.logging_dir)
 
             if self._swanlab.get_run() is None:
                 self._swanlab.init(
                     **init_args,
                 )
-            # show transformers logo!
+            # show paddlenlp logo!
             self._swanlab.config["FRAMEWORK"] = "paddlenlp"
             # add config parameters (run may have been created manually)
             self._swanlab.config.update(combined_dict)
